@@ -50,11 +50,11 @@
             "default": ".*\\.log$",
             "hint": "一行一个正则表达式，文件名将从上到下依次匹配"
           },
-          "skills": {
-            "description": "触发时建议使用的技能",
-            "type": "string",
+          "prompt": {
+            "description": "触发时注入的提示词",
+            "type": "text",
             "default": "",
-            "hint": "选择要建议的技能，留空不注入任何提示"
+            "hint": "多行文本，将作为系统提示注入到 LLM 请求中，留空则使用默认提示"
           }
         }
       }

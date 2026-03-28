@@ -1,10 +1,12 @@
 """QQ File Plugin - Main Entry Point"""
 
 import json
+import time
 from typing import Optional
 from astrbot.api.star import Context, Star, register
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File
 from .config import PluginConfig, AutoProcessTemplate
 from .utils import format_file_size
 
@@ -22,6 +24,7 @@ class QQFilePlugin(Star):
         super().__init__(context)
         self.config = PluginConfig(config or {})
         self._setup_data_dir()
+        self._processed_files: dict[str, float] = {}  # 用于去重
 
     def _setup_data_dir(self):
         """Initialize data directory"""
@@ -350,78 +353,140 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 获取文件信息失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_group_upload(self, event: AstrMessageEvent):
-        """处理群文件上传事件"""
+        """处理群文件上传事件（支持通知事件和File组件消息）"""
+        group_id = event.get_group_id()
+        user_id = event.get_sender_id()
+
         raw_msg = event.message_obj.raw_message
 
-        if not isinstance(raw_msg, dict):
+        if isinstance(raw_msg, dict) and raw_msg.get("notice_type") == "group_upload":
+            file_info = raw_msg.get("file", {})
+            file_name = file_info.get("name", "")
+            file_id = file_info.get("id")
+            file_size = file_info.get("size", 0)
+            busid = file_info.get("busid")
+        else:
+            file_components = [
+                comp for comp in event.message_obj.message if isinstance(comp, File)
+            ]
+            if not file_components:
+                return
+
+            file_comp = file_components[0]
+            file_name = file_comp.name or ""
+            file_id = getattr(file_comp, "file_id", None)
+            file_size = 0
+            busid = None
+
+            if isinstance(raw_msg, dict):
+                msg_data = raw_msg.get("message", [])
+                if msg_data and isinstance(msg_data, list):
+                    for seg in msg_data:
+                        if isinstance(seg, dict) and seg.get("type") == "file":
+                            data = seg.get("data", {})
+                            file_id = data.get("file_id", file_id)
+                            file_size = data.get("file_size", 0) or data.get("size", 0)
+                            busid = data.get("busid")
+                            break
+
+        if not file_name:
             return
 
-        if raw_msg.get("notice_type") != "group_upload":
+        if not group_id:
             return
 
-        group_id = raw_msg.get("group_id")
-        user_id = raw_msg.get("user_id")
-        file_info = raw_msg.get("file", {})
+        # 确保 group_id 为整数类型
+        try:
+            group_id = int(group_id)
+        except (ValueError, TypeError):
+            logger.warning(f"[QQFile] 无效的 group_id: {group_id}")
+            return
 
-        file_name = file_info.get("name", "")
-        file_id = file_info.get("id")
-        file_size = file_info.get("size", 0)
-        busid = file_info.get("busid")
+        # 去重：同一群同一文件在5秒内只处理一次
+        dedup_key = f"{group_id}:{file_name}"
+        now = time.time()
+        if dedup_key in self._processed_files:
+            if now - self._processed_files[dedup_key] < 5:
+                logger.debug(f"[QQFile] 跳过重复文件事件: {file_name}")
+                return
+        self._processed_files[dedup_key] = now
+
+        # 清理过期的去重记录
+        expired_keys = [k for k, v in self._processed_files.items() if now - v > 60]
+        for k in expired_keys:
+            del self._processed_files[k]
 
         logger.info(
             f"[QQFile] 检测到群文件上传: {file_name} 在群 {group_id} 由用户 {user_id}"
         )
 
+        if not self.config.enable_auto_process:
+            logger.info(
+                "[QQFile] 文件自动处理功能未启用，请在配置中开启 enable_auto_process"
+            )
+            return
+
         template = self.config.match_auto_process_template(group_id, file_name)
 
         if not template:
-            logger.debug(f"[QQFile] 跳过自动处理: {file_name}")
+            logger.info(
+                f"[QQFile] 未匹配到自动处理模板: file_name={file_name}, group_id={group_id}"
+            )
             return
 
-        logger.info(
-            f"[QQFile] 触发自动处理: {file_name} "
-            f"(匹配模板，建议技能: {template.skills})"
-        )
+        logger.info(f"[QQFile] 触发自动处理: {file_name} (匹配模板)")
+
+        file_url = None
+        bot = getattr(event, "bot", None)
+        if bot and file_id:
+            try:
+                result = await bot.api.call_action(
+                    "get_group_file_url",
+                    group_id=group_id,
+                    file_id=file_id,
+                )
+                if result and isinstance(result, dict):
+                    file_url = result.get("url")
+            except Exception as e:
+                logger.warning(f"[QQFile] 获取文件下载链接失败: {e}")
 
         file_context = self._build_file_context(
             file_name=file_name,
-            file_id=file_id,
-            busid=busid,
+            file_url=file_url,
             file_size=file_size,
             group_id=group_id,
             user_id=user_id,
-            template=template,
         )
 
-        try:
-            await event.send(file_context)
-        except Exception as e:
-            logger.error(f"[QQFile] 发送文件上下文失败: {e}")
+        custom_prompt = template.prompt.strip() if template.prompt else None
+
+        event.is_at_or_wake_command = True
+        event.is_wake = True
+        yield event.request_llm(
+            prompt=file_context,
+            system_prompt=custom_prompt,
+        )
 
     def _build_file_context(
         self,
         file_name: str,
-        file_id: str,
-        busid: int,
+        file_url: str | None,
         file_size: int,
         group_id: int,
         user_id: int,
-        template: AutoProcessTemplate,
     ) -> str:
         """构建文件上下文消息"""
         lines = [
             "[系统提示] 检测到群文件上传",
             f"上传者: {user_id}",
             f"文件名: {file_name}",
-            f"文件ID: {file_id}",
             f"文件大小: {format_file_size(file_size)}",
         ]
 
-        if template.skills:
-            skills_str = ", ".join(template.skills)
-            lines.append(f"建议使用以下技能处理: {skills_str}")
+        if file_url:
+            lines.append(f"文件下载链接: {file_url}")
 
         lines.append("请根据上传的文件内容进行处理。")
         return "\n".join(lines)

@@ -11,7 +11,7 @@ class AutoProcessTemplate:
 
     group_ids: List[int]
     file_patterns: List[re.Pattern]
-    skills: Optional[List[str]]  # None/[] = no hint, non-empty = hint skills
+    prompt: str  # 自定义提示词，留空使用默认
 
 
 class PluginConfig:
@@ -90,14 +90,14 @@ class PluginConfig:
             patterns_text = template_data.get("file_patterns", "")
             file_patterns = self._parse_patterns_from_textarea(patterns_text)
 
-            # Parse skills (None means all, [] means none, ["skill1"] means specific)
-            skills = template_data.get("skills")
+            # Parse prompt (multi-line text)
+            prompt = template_data.get("prompt", "") or ""
 
             templates.append(
                 AutoProcessTemplate(
                     group_ids=group_ids,
                     file_patterns=file_patterns,
-                    skills=skills,
+                    prompt=prompt,
                 )
             )
 
@@ -126,16 +126,24 @@ class PluginConfig:
         if not self.enable_auto_process:
             return None
 
-        for template in self.auto_process_templates:
+        from astrbot.api import logger
+
+        for i, template in enumerate(self.auto_process_templates):
             # Check group match (empty group_ids means match all groups)
-            if template.group_ids and group_id not in template.group_ids:
-                continue
+            if template.group_ids:
+                if group_id not in template.group_ids:
+                    logger.debug(
+                        f"[QQFile] 模板[{i}] 群号不匹配: {group_id} not in {template.group_ids}"
+                    )
+                    continue
 
             # Check file pattern match (empty patterns means match all files)
             if template.file_patterns:
-                if not any(
+                matched = any(
                     pattern.search(file_name) for pattern in template.file_patterns
-                ):
+                )
+                if not matched:
+                    logger.debug(f"[QQFile] 模板[{i}] 文件名不匹配: {file_name}")
                     continue
 
             # This template matches
