@@ -1,0 +1,63 @@
+{
+  "access_mode": {
+    "description": "访问控制模式",
+    "type": "string",
+    "default": "blacklist",
+    "hint": "blacklist(黑名单: 列表中的群/用户禁止使用) / whitelist(白名单: 仅列表中的群可使用)"
+  },
+  "group_list": {
+    "description": "群号/用户QQ号列表",
+    "type": "text",
+    "default": "",
+    "hint": "黑名单/白名单号码，用英文逗号分隔，如 123456,789012。在黑名单模式下私聊默认允许，白名单模式下私聊默认禁止"
+  },
+  "max_file_list_limit": {
+    "description": "最大文件列表返回数量",
+    "type": "int",
+    "default": 50,
+    "hint": "获取文件列表时最多返回的文件数量 (1-100)"
+  },
+  "enable_file_search": {
+    "description": "启用文件搜索功能",
+    "type": "bool",
+    "default": true,
+    "hint": "是否允许使用 search_qq_files 工具搜索群文件"
+  },
+  "enable_auto_process": {
+    "description": "启用文件自动处理",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，当群文件上传时，根据模板组配置触发机器人处理"
+  },
+  "auto_process_templates": {
+    "description": "文件自动处理模板组",
+    "type": "template_list",
+    "hint": "自上而下匹配的多组模板，每个模板可配置群号、文件正则和技能",
+    "templates": {
+      "process_template": {
+        "name": "处理模板",
+        "hint": "配置文件上传时的自动处理规则",
+        "items": {
+          "group_ids": {
+            "description": "群号码列表",
+            "type": "text",
+            "default": "",
+            "hint": "一行一个群号，留空表示匹配所有群"
+          },
+          "file_patterns": {
+            "description": "文件名匹配正则表达式",
+            "type": "text",
+            "default": ".*\\.log$",
+            "hint": "一行一个正则表达式，文件名将从上到下依次匹配"
+          },
+          "skills": {
+            "description": "触发时建议使用的技能",
+            "type": "string",
+            "default": "",
+            "hint": "选择要建议的技能，留空不注入任何提示"
+          }
+        }
+      }
+    }
+  }
+}

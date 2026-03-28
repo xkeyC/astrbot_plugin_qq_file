@@ -1,0 +1,5 @@
+name: astrbot_plugin_qq_file
+version: 0.0.1
+author: xkeyC
+description: QQ文件管理插件，支持LLM通过Tools查询群文件和私聊文件、获取文件直链，支持监听群文件上传并自动处理
+url: https://github.com/xkeyC/astrbot_plugin_qq_file
