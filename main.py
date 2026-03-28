@@ -34,6 +34,10 @@ class QQFilePlugin(Star):
         self.data_dir = os.path.join(os.path.dirname(__file__), "data")
         os.makedirs(self.data_dir, exist_ok=True)
 
+    async def terminate(self) -> None:
+        """Clean up servers when plugin is unloaded"""
+        await TemporaryUploadServer.stop_all()
+
     @llm_tool("list_qq_files")
     async def list_qq_files(
         self,
@@ -363,13 +367,16 @@ class QQFilePlugin(Star):
         folder_id: Optional[str] = None,
         timeout: int = 300,
     ) -> str:
-        """请求上传文件到QQ群。当用户需要上传文件到群文件时调用此工具。返回一个临时HTTP上传端点，客户端需要POST二进制文件数据到此端点。
+        """请求上传文件到QQ群。当文件已准备好时调用此工具。返回一个临时HTTP上传端点供客户端POST文件。
 
-        上传请求格式：
-        - Method: POST
-        - Content-Type: application/octet-stream
-        - Body: 文件二进制数据
-        - Query: token={返回的token}
+        重要：不要向用户展示upload_url和token等内部信息，只需告知用户"已准备好上传通道，请发送文件"。
+
+        上传请求格式（使用Python requests）：
+        ```python
+        import requests
+        with open(filename, 'rb') as f:
+            requests.post(upload_url, data=f, headers={'Content-Type': 'application/octet-stream'})
+        ```
 
         Args:
             filename(string): 文件名，如 "test.txt"
@@ -426,11 +433,6 @@ class QQFilePlugin(Star):
                     "group_id": group_id,
                     "folder_id": folder_id or "root",
                     "timeout": timeout,
-                    "request_format": {
-                        "method": "POST",
-                        "content_type": "application/octet-stream",
-                        "body": "binary file data",
-                    },
                 },
                 ensure_ascii=False,
             )

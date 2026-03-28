@@ -39,6 +39,8 @@ def get_lan_ip() -> Optional[str]:
 
 
 class TemporaryUploadServer:
+    _instances: list["TemporaryUploadServer"] = []
+
     def __init__(
         self,
         host: str,
@@ -62,12 +64,22 @@ class TemporaryUploadServer:
         self._runner = None
         self._timeout_task = None
         self._file_received = asyncio.Event()
+        self._file_data: Optional[BytesIO] = None
+        self._file_served = asyncio.Event()
+        TemporaryUploadServer._instances.append(self)
+
+    @classmethod
+    async def stop_all(cls):
+        for instance in cls._instances[:]:
+            await instance.stop()
+        cls._instances.clear()
 
     async def start(self):
         from aiohttp import web
 
         app = web.Application()
         app.router.add_post("/upload", self._handle_upload)
+        app.router.add_get("/files/{file_token}", self._handle_download)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -89,6 +101,8 @@ class TemporaryUploadServer:
             await self.stop()
 
     async def stop(self):
+        if self in TemporaryUploadServer._instances:
+            TemporaryUploadServer._instances.remove(self)
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -113,17 +127,21 @@ class TemporaryUploadServer:
                     {"success": False, "error": "Empty body"}, status=400
                 )
 
-            file_data = BytesIO(file_bytes)
+            self._file_data = BytesIO(file_bytes)
             file_size = len(file_bytes)
 
             logger.info(
                 f"[QQFile] 收到文件上传: {self.filename}, 大小: {format_file_size(file_size)}"
             )
 
-            upload_result = await self._upload_to_qq(file_data)
+            file_url = (
+                f"http://{self.host}:{self.port}/files/{self.token}?token={self.token}"
+            )
+            upload_result = await self._upload_to_qq(file_url)
             self._file_received.set()
 
             if upload_result.get("success"):
+                await self._file_served.wait()
                 asyncio.create_task(self._delayed_stop())
                 return web.json_response(
                     {
@@ -145,34 +163,43 @@ class TemporaryUploadServer:
             logger.error(f"[QQFile] 处理上传失败: {e}")
             return web.json_response({"success": False, "error": str(e)}, status=500)
 
-    async def _upload_to_qq(self, file_data: BytesIO) -> dict:
-        import tempfile
-        import os
+    async def _handle_download(self, request):
+        from aiohttp import web
 
+        file_token = request.match_info.get("file_token")
+        token = request.query.get("token")
+        if file_token != self.token or token != self.token:
+            return web.Response(status=403, text="Forbidden")
+
+        if not self._file_data:
+            return web.Response(status=404, text="File not found")
+
+        self._file_data.seek(0)
+        data = self._file_data.getvalue()
+        self._file_served.set()
+
+        return web.Response(
+            body=data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": f'attachment; filename="{self.filename}"',
+            },
+        )
+
+    async def _upload_to_qq(self, file_url: str) -> dict:
         try:
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=f"_{self.filename}"
-            ) as tmp:
-                tmp.write(file_data.getvalue())
-                tmp_path = tmp.name
+            params = {
+                "group_id": str(self.group_id),
+                "file": file_url,
+                "name": self.filename,
+            }
+            if self.folder_id:
+                params["folder"] = self.folder_id
+            logger.debug(f"[QQFile] 上传参数: {params}")
+            result = await self.bot.api.call_action("upload_group_file", **params)
 
-            try:
-                result = await self.bot.api.call_action(
-                    "upload_group_file",
-                    group_id=self.group_id,
-                    file=tmp_path,
-                    name=self.filename,
-                    folder=self.folder_id,
-                )
-
-                logger.info(
-                    f"[QQFile] 文件上传成功: {self.filename} -> 群 {self.group_id}"
-                )
-                return {"success": True, "file_id": result.get("file_id")}
-
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+            logger.info(f"[QQFile] 文件上传成功: {self.filename} -> 群 {self.group_id}")
+            return {"success": True, "file_id": result.get("file_id")}
 
         except Exception as e:
             logger.error(f"[QQFile] 上传到QQ失败: {e}")
