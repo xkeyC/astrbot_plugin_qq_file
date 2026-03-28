@@ -2,13 +2,14 @@
 
 import json
 import time
+import uuid
 from typing import Optional
 from astrbot.api.star import Context, Star, register
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File
-from .config import PluginConfig, AutoProcessTemplate
-from .utils import format_file_size
+from .config import PluginConfig
+from .utils import format_file_size, get_lan_ip, TemporaryUploadServer
 
 
 @register(
@@ -353,6 +354,91 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 获取文件信息失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
+    @llm_tool("request_file_upload")
+    async def request_file_upload(
+        self,
+        event: AstrMessageEvent,
+        filename: str,
+        group_id: Optional[int] = None,
+        folder_id: Optional[str] = None,
+        timeout: int = 300,
+    ) -> str:
+        """请求上传文件到QQ群。当用户需要上传文件到群文件时调用此工具。返回一个临时HTTP上传端点，客户端需要POST二进制文件数据到此端点。
+
+        上传请求格式：
+        - Method: POST
+        - Content-Type: application/octet-stream
+        - Body: 文件二进制数据
+        - Query: token={返回的token}
+
+        Args:
+            filename(string): 文件名，如 "test.txt"
+            group_id(number): 可选。目标群号。不提供时自动从当前会话获取。
+            folder_id(string): 可选。目标文件夹ID。不提供则上传到根目录。
+            timeout(number): 可选。上传等待超时时间（秒）。默认300秒。
+
+        Returns:
+            str: 包含上传URL和token的JSON字符串，客户端需在timeout秒内POST文件
+        """
+        if group_id is None:
+            group_id = event.get_group_id()
+            if not group_id:
+                return '{"error": "无法获取群号，请在群聊中使用或手动指定群号"}'
+
+        if not self.config.check_access(group_id, event.get_sender_id()):
+            return '{"error": "无权限访问"}'
+
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return '{"error": "Bot不可用"}'
+
+        try:
+            lan_ip = get_lan_ip()
+            if not lan_ip:
+                return '{"error": "无法获取局域网IP地址"}'
+
+            upload_token = str(uuid.uuid4())
+            server = TemporaryUploadServer(
+                host=lan_ip,
+                port=0,
+                token=upload_token,
+                timeout=timeout,
+                bot=bot,
+                group_id=group_id,
+                folder_id=folder_id,
+                filename=filename,
+            )
+
+            await server.start()
+            port = server.port
+            upload_url = f"http://{lan_ip}:{port}/upload?token={upload_token}"
+
+            logger.info(
+                f"[QQFile] 文件上传服务器已启动: {upload_url}, 文件名: {filename}, 群: {group_id}, 超时: {timeout}秒"
+            )
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "upload_url": upload_url,
+                    "token": upload_token,
+                    "filename": filename,
+                    "group_id": group_id,
+                    "folder_id": folder_id or "root",
+                    "timeout": timeout,
+                    "request_format": {
+                        "method": "POST",
+                        "content_type": "application/octet-stream",
+                        "body": "binary file data",
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+        except Exception as e:
+            logger.error(f"[QQFile] 启动上传服务器失败: {e}")
+            return f'{{"error": "{str(e)}"}}'
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_group_upload(self, event: AstrMessageEvent):
         """处理群文件上传事件（支持通知事件和File组件消息）"""
@@ -366,7 +452,7 @@ class QQFilePlugin(Star):
             file_name = file_info.get("name", "")
             file_id = file_info.get("id")
             file_size = file_info.get("size", 0)
-            busid = file_info.get("busid")
+            _busid = file_info.get("busid")
         else:
             file_components = [
                 comp for comp in event.message_obj.message if isinstance(comp, File)
@@ -378,7 +464,7 @@ class QQFilePlugin(Star):
             file_name = file_comp.name or ""
             file_id = getattr(file_comp, "file_id", None)
             file_size = 0
-            busid = None
+            _busid = None
 
             if isinstance(raw_msg, dict):
                 msg_data = raw_msg.get("message", [])
@@ -388,7 +474,7 @@ class QQFilePlugin(Star):
                             data = seg.get("data", {})
                             file_id = data.get("file_id", file_id)
                             file_size = data.get("file_size", 0) or data.get("size", 0)
-                            busid = data.get("busid")
+                            _busid = data.get("busid")
                             break
 
         if not file_name:
