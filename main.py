@@ -442,6 +442,126 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 启动上传服务器失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
+    @llm_tool("delete_qq_files")
+    async def delete_qq_files(
+        self,
+        event: AstrMessageEvent,
+        file_ids: str,
+        group_id: Optional[int] = None,
+    ) -> str:
+        """批量删除QQ群文件。当用户需要删除群文件时调用此工具。
+
+        Args:
+            file_ids(string): 文件ID列表，多个ID用逗号分隔。如 "file_id1,file_id2,file_id3"
+            group_id(number): 可选。群号。不提供时自动从当前会话获取。
+
+        Returns:
+            str: 删除结果的JSON字符串
+        """
+        if group_id is None:
+            group_id = event.get_group_id()
+            if not group_id:
+                return '{"error": "无法获取群号，请在群聊中使用或手动指定群号"}'
+
+        if not self.config.check_access(group_id, event.get_sender_id()):
+            return '{"error": "无权限访问"}'
+
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return '{"error": "Bot不可用"}'
+
+        try:
+            ids = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
+            if not ids:
+                return '{"error": "未提供有效的文件ID"}'
+
+            results = []
+            success_count = 0
+            fail_count = 0
+
+            for file_id in ids:
+                try:
+                    await bot.api.call_action(
+                        "delete_group_file",
+                        group_id=str(group_id),
+                        file_id=file_id,
+                    )
+                    results.append({"file_id": file_id, "success": True})
+                    success_count += 1
+                    logger.info(f"[QQFile] 删除文件成功: {file_id} in 群 {group_id}")
+                except Exception as e:
+                    results.append(
+                        {"file_id": file_id, "success": False, "error": str(e)}
+                    )
+                    fail_count += 1
+                    logger.warning(f"[QQFile] 删除文件失败: {file_id}, 错误: {e}")
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "group_id": group_id,
+                    "total": len(ids),
+                    "success_count": success_count,
+                    "fail_count": fail_count,
+                    "results": results,
+                },
+                ensure_ascii=False,
+            )
+
+        except Exception as e:
+            logger.error(f"[QQFile] 批量删除文件失败: {e}")
+            return f'{{"error": "{str(e)}"}}'
+
+    @llm_tool("delete_qq_folder")
+    async def delete_qq_folder(
+        self,
+        event: AstrMessageEvent,
+        folder_id: str,
+        group_id: Optional[int] = None,
+    ) -> str:
+        """删除QQ群文件夹。当用户需要删除群文件夹时调用此工具。注意：删除文件夹会删除其中的所有文件。
+
+        Args:
+            folder_id(string): 文件夹ID
+            group_id(number): 可选。群号。不提供时自动从当前会话获取。
+
+        Returns:
+            str: 删除结果的JSON字符串
+        """
+        if group_id is None:
+            group_id = event.get_group_id()
+            if not group_id:
+                return '{"error": "无法获取群号，请在群聊中使用或手动指定群号"}'
+
+        if not self.config.check_access(group_id, event.get_sender_id()):
+            return '{"error": "无权限访问"}'
+
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return '{"error": "Bot不可用"}'
+
+        try:
+            await bot.api.call_action(
+                "delete_group_folder",
+                group_id=str(group_id),
+                folder_id=folder_id,
+            )
+
+            logger.info(f"[QQFile] 删除文件夹成功: {folder_id} in 群 {group_id}")
+            return json.dumps(
+                {
+                    "success": True,
+                    "group_id": group_id,
+                    "folder_id": folder_id,
+                    "message": "文件夹删除成功",
+                },
+                ensure_ascii=False,
+            )
+
+        except Exception as e:
+            logger.error(f"[QQFile] 删除文件夹失败: {e}")
+            return f'{{"error": "{str(e)}"}}'
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_group_upload(self, event: AstrMessageEvent):
         """处理群文件上传事件（支持通知事件和File组件消息）"""
