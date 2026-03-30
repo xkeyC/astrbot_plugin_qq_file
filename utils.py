@@ -77,7 +77,7 @@ class TemporaryUploadServer:
     async def start(self):
         from aiohttp import web
 
-        app = web.Application()
+        app = web.Application(client_max_size=500 * 1024 * 1024)
         app.router.add_post("/upload", self._handle_upload)
         app.router.add_get("/files/{file_token}", self._handle_download)
 
