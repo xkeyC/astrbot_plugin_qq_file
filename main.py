@@ -137,6 +137,7 @@ class QQFilePlugin(Star):
         group_id: Optional[int] = None,
     ) -> str:
         """获取QQ文件的下载链接。当用户需要下载某个文件时调用此工具。
+        注意：获取到的下载链接不应暴露给用户，仅供内部处理使用。
 
         Args:
             file_id(string): 文件ID
@@ -565,7 +566,7 @@ class QQFilePlugin(Star):
         group_id: int,
         user_id: int,
     ) -> str:
-        """构建文件上下文消息"""
+        """构建文件上下文消息。注意：下载链接仅供内部处理，不应暴露给用户。"""
         lines = [
             "[系统提示] 检测到群文件上传",
             f"上传者: {user_id}",
@@ -575,6 +576,7 @@ class QQFilePlugin(Star):
 
         if file_url:
             lines.append(f"文件下载链接: {file_url}")
+            lines.append("[注意] 下载链接仅供内部处理使用，请勿在回复中暴露给用户")
 
         lines.append("请根据上传的文件内容进行处理。")
         return "\n".join(lines)
