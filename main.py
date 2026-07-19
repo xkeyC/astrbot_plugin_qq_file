@@ -1,9 +1,11 @@
 """QQ File Plugin - Main Entry Point"""
 
+import base64
 import json
+import math
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from astrbot.api.star import Context, Star, register
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -15,11 +17,11 @@ from .utils import format_file_size, get_lan_ip, TemporaryUploadServer
 @register(
     "astrbot_plugin_qq_file",
     "xkeyC",
-    "QQ文件管理插件，支持LLM工具查询文件和自动处理上传文件",
-    "3.0.0",
+    "QQ信息与文件管理插件，支持LLM查询群文件、群相册、群成员并自动处理上传文件",
+    "3.2.0",
 )
 class QQFilePlugin(Star):
-    """QQ文件管理插件 - 支持LLM Tools和文件上传监听"""
+    """QQ信息与文件管理插件 - 支持LLM Tools和文件上传监听"""
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -38,23 +40,255 @@ class QQFilePlugin(Star):
         """Clean up servers when plugin is unloaded"""
         await TemporaryUploadServer.stop_all()
 
-    @llm_tool("list_qq_files")
-    async def list_qq_files(
+    @staticmethod
+    def _format_group_file(file_data: dict[str, Any]) -> dict[str, Any]:
+        """Map a NapCat group-file item to the common qq_file shape."""
+        size = file_data.get("file_size", file_data.get("size", 0)) or 0
+        return {
+            "type": "file",
+            "source": "group_file",
+            "id": file_data.get("file_id"),
+            "name": file_data.get("file_name"),
+            "size": format_file_size(int(size)),
+            "size_bytes": int(size),
+            "busid": file_data.get("busid"),
+            "upload_time": file_data.get("upload_time"),
+            "uploader_id": file_data.get("uploader"),
+            "uploader": file_data.get("uploader_name"),
+        }
+
+    @staticmethod
+    def _format_group_folder(folder_data: dict[str, Any]) -> dict[str, Any]:
+        """Map a NapCat group-file folder to the common qq_file shape."""
+        return {
+            "type": "folder",
+            "source": "group_file",
+            "id": folder_data.get("folder_id"),
+            "name": folder_data.get("folder_name"),
+            "create_time": folder_data.get("create_time"),
+            "creator_id": folder_data.get("creator"),
+            "creator": folder_data.get("creator_name"),
+            "file_count": folder_data.get("total_file_count"),
+        }
+
+    @staticmethod
+    def _first_value(data: dict[str, Any], *keys: str) -> Any:
+        """Read the first non-empty value, including common nested media objects."""
+        containers = [data]
+        for container_name in (
+            "media_info",
+            "photo_info",
+            "pic_info",
+            "file_info",
+            "video_info",
+        ):
+            container = data.get(container_name)
+            if isinstance(container, dict):
+                containers.append(container)
+
+        for key in keys:
+            for container in containers:
+                value = container.get(key)
+                if value not in (None, "", []):
+                    return value
+        return None
+
+    @classmethod
+    def _format_group_album(cls, album: dict[str, Any]) -> dict[str, Any]:
+        """Map a NapCat album to a folder-like qq_file item."""
+        return {
+            "type": "folder",
+            "folder_type": "album",
+            "source": "group_album",
+            "id": cls._first_value(album, "album_id", "id"),
+            "name": cls._first_value(album, "album_name", "name", "title"),
+            "cover_url": cls._first_value(album, "cover_url", "cover"),
+            "create_time": cls._first_value(album, "create_time", "createTime"),
+            "update_time": cls._first_value(album, "update_time", "updateTime"),
+            "creator_id": cls._first_value(album, "creator", "creator_id", "uin"),
+            "media_count": cls._first_value(
+                album, "media_count", "photo_count", "pic_count", "count"
+            ),
+        }
+
+    @staticmethod
+    def _expand_group_album_media_feeds(
+        feeds: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Expand NapCat cell_media.media_items so one qq_file means one media."""
+        expanded: list[dict[str, Any]] = []
+        for feed in feeds:
+            if not isinstance(feed, dict):
+                continue
+
+            cell_media = feed.get("cell_media")
+            media_items = (
+                cell_media.get("media_items") if isinstance(cell_media, dict) else None
+            )
+            if not isinstance(media_items, list):
+                # Keep compatibility with older/flattened NapCat response shapes.
+                expanded.append(feed)
+                continue
+
+            cell_common = feed.get("cell_common")
+            cell_common = cell_common if isinstance(cell_common, dict) else {}
+            cell_user_info = feed.get("cell_user_info")
+            cell_user_info = (
+                cell_user_info if isinstance(cell_user_info, dict) else {}
+            )
+            user = cell_user_info.get("user")
+            user = user if isinstance(user, dict) else {}
+
+            for media_item in media_items:
+                if not isinstance(media_item, dict):
+                    continue
+
+                normalized = {
+                    "album_id": cell_media.get("album_id"),
+                    "batch_id": cell_media.get("batch_id"),
+                    "upload_time": cell_common.get("time"),
+                    "uploader_id": user.get("uin", user.get("user_id")),
+                    "uploader_name": user.get(
+                        "nickname", user.get("nick", user.get("name"))
+                    ),
+                    "media_item": media_item,
+                }
+                for key, value in media_item.items():
+                    if key not in ("image", "video"):
+                        normalized[key] = value
+
+                # A video item may also carry an image thumbnail, so prefer video.
+                for media_type in ("video", "image"):
+                    media_data = media_item.get(media_type)
+                    if isinstance(media_data, dict):
+                        normalized.update(media_data)
+                        normalized["media_type"] = media_type
+                        normalized[media_type] = media_data
+                        break
+
+                expanded.append(normalized)
+
+        return expanded
+
+    @classmethod
+    def _format_group_album_media(cls, media: dict[str, Any]) -> dict[str, Any]:
+        """Map a NapCat album media item to the common qq_file shape."""
+        media_id = cls._first_value(media, "media_id", "lloc", "id", "batch_id")
+        name = cls._first_value(
+            media, "file_name", "name", "photo_name", "title", "desc"
+        )
+        size = cls._first_value(media, "file_size", "size")
+        try:
+            size_bytes = int(size or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+
+        return {
+            "type": "file",
+            "file_type": "album_media",
+            "media_type": cls._first_value(media, "media_type", "type"),
+            "source": "group_album",
+            "id": media_id,
+            "name": name or (f"相册媒体-{media_id}" if media_id else "相册媒体"),
+            "size": format_file_size(size_bytes) if size is not None else None,
+            "size_bytes": size_bytes if size is not None else None,
+            "url": cls._first_value(
+                media,
+                "url",
+                "origin_url",
+                "original_url",
+                "download_url",
+                "raw_url",
+            ),
+            "thumbnail_url": cls._first_value(
+                media, "thumbnail_url", "thumb_url", "cover_url"
+            ),
+            "upload_time": cls._first_value(
+                media, "upload_time", "create_time", "shoot_time", "time"
+            ),
+            "uploader_id": cls._first_value(
+                media, "uploader", "uploader_id", "user_id", "uin"
+            ),
+            "uploader": cls._first_value(
+                media, "uploader_name", "nickname", "nick", "user_name"
+            ),
+            "album_id": cls._first_value(media, "album_id"),
+            "batch_id": cls._first_value(media, "batch_id"),
+            "lloc": cls._first_value(media, "lloc"),
+        }
+
+    @staticmethod
+    def _unwrap_response(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return {}
+        response = result.get("response")
+        return response if isinstance(response, dict) else result
+
+    @staticmethod
+    def _encode_album_cursor(attach_info: str, offset: int) -> str:
+        payload = json.dumps(
+            {"attach_info": attach_info, "offset": offset},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "qqac1_" + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_album_cursor(cursor: Optional[str]) -> tuple[str, int]:
+        if not cursor or not cursor.startswith("qqac1_"):
+            return cursor or "", 0
+        encoded = cursor.removeprefix("qqac1_")
+        try:
+            encoded += "=" * (-len(encoded) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+            return str(payload.get("attach_info", "")), max(int(payload.get("offset", 0)), 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return cursor, 0
+
+    @classmethod
+    def _paginate_album_items(
+        cls,
+        items: list[Any],
+        request_attach_info: str,
+        offset: int,
+        limit: int,
+        response_attach_info: str,
+        protocol_has_more: bool,
+    ) -> tuple[list[dict[str, Any]], Optional[str], bool]:
+        normalized_items = [item for item in items if isinstance(item, dict)]
+        page_items = normalized_items[offset : offset + limit]
+        next_offset = offset + len(page_items)
+
+        if next_offset < len(normalized_items):
+            next_cursor = cls._encode_album_cursor(request_attach_info, next_offset)
+            return page_items, next_cursor, True
+        if protocol_has_more and response_attach_info:
+            return page_items, response_attach_info, True
+        return page_items, None, False
+
+    @llm_tool("qq_file")
+    async def qq_file(
         self,
         event: AstrMessageEvent,
         group_id: Optional[int] = None,
+        source: str = "group_file",
         folder_id: Optional[str] = None,
+        album_id: Optional[str] = None,
+        cursor: Optional[str] = None,
         limit: int = 20,
     ) -> str:
-        """列出QQ群文件。当用户询问群文件、查看文件列表时调用此工具。如未指定群号，自动从当前会话获取。
+        """统一查询QQ群文件或群相册。当用户询问群文件、群相册、照片或视频时调用。
 
         Args:
             group_id(number): 可选。群号。不提供时自动从当前会话获取。
+            source(string): 可选。来源：group_file（群文件，默认）或 group_album（群相册）。
             folder_id(string): 可选。文件夹ID，用于列出特定文件夹内的文件。不提供则列出根目录文件。
+            album_id(string): 可选。相册ID。source=group_album 时，不提供则列相册，提供则列相册媒体。
+            cursor(string): 可选。群相册分页游标，使用上一次返回的 next_cursor。
             limit(number): 可选。返回的最大文件/文件夹数量。默认为20。
 
         Returns:
-            str: 文件列表信息的JSON字符串，包含文件和文件夹信息
+            str: 统一的 qq_file JSON；每个条目都有 source 标明来源
         """
         if group_id is None:
             group_id = event.get_group_id()
@@ -69,58 +303,116 @@ class QQFilePlugin(Star):
             return '{"error": "Bot不可用"}'
 
         try:
-            limit = min(limit, self.config.max_file_list_limit)
+            limit = max(1, min(limit, self.config.max_file_list_limit))
+            source_aliases = {
+                "file": "group_file",
+                "files": "group_file",
+                "group_file": "group_file",
+                "album": "group_album",
+                "albums": "group_album",
+                "group_album": "group_album",
+            }
+            normalized_source = source_aliases.get(str(source or "").lower())
+            if not normalized_source:
+                return '{"error": "source 仅支持 group_file 或 group_album"}'
 
-            if folder_id:
-                result = await bot.api.call_action(
-                    "get_group_files_by_folder",
-                    group_id=group_id,
-                    folder_id=folder_id,
+            if normalized_source == "group_file":
+                if folder_id:
+                    result = await bot.api.call_action(
+                        "get_group_files_by_folder",
+                        group_id=group_id,
+                        folder_id=folder_id,
+                    )
+                else:
+                    result = await bot.api.call_action(
+                        "get_group_root_files",
+                        group_id=group_id,
+                    )
+
+                result = self._unwrap_response(result)
+                files = [
+                    self._format_group_file(item)
+                    for item in result.get("files", [])[:limit]
+                    if isinstance(item, dict)
+                ]
+                folders = [
+                    self._format_group_folder(item)
+                    for item in result.get("folders", [])[:limit]
+                    if isinstance(item, dict)
+                ]
+
+                return json.dumps(
+                    {
+                        "success": True,
+                        "source": normalized_source,
+                        "group_id": group_id,
+                        "folder_id": folder_id or "root",
+                        "file_count": len(files),
+                        "folder_count": len(folders),
+                        "files": files,
+                        "folders": folders,
+                    },
+                    ensure_ascii=False,
                 )
+
+            request_attach_info, offset = self._decode_album_cursor(cursor)
+            if album_id:
+                result = await bot.api.call_action(
+                    "get_group_album_media_list",
+                    group_id=str(group_id),
+                    album_id=album_id,
+                    attach_info=request_attach_info,
+                )
+                result = self._unwrap_response(result)
+                raw_items = result.get("media_list")
+                if not isinstance(raw_items, list):
+                    raw_items = result.get("feed_list", result.get("feeds", []))
+                raw_items = self._expand_group_album_media_feeds(
+                    raw_items if isinstance(raw_items, list) else []
+                )
+                view = "album_media"
             else:
                 result = await bot.api.call_action(
-                    "get_group_root_files",
-                    group_id=group_id,
+                    "get_qun_album_list",
+                    group_id=str(group_id),
+                    attach_info=request_attach_info,
                 )
+                result = self._unwrap_response(result)
+                raw_items = result.get("album_list", [])
+                view = "albums"
 
-            files = result.get("files", []) if isinstance(result, dict) else []
-            folders = result.get("folders", []) if isinstance(result, dict) else []
+            raw_items = raw_items if isinstance(raw_items, list) else []
+            response_attach_info = str(result.get("attach_info") or "")
+            protocol_has_more = bool(result.get("has_more", False))
+            page_items, next_cursor, has_more = self._paginate_album_items(
+                raw_items,
+                request_attach_info,
+                offset,
+                limit,
+                response_attach_info,
+                protocol_has_more,
+            )
 
-            formatted_files = []
-            for f in files[:limit]:
-                formatted_files.append(
-                    {
-                        "type": "file",
-                        "id": f.get("file_id"),
-                        "name": f.get("file_name"),
-                        "size": format_file_size(f.get("file_size", 0)),
-                        "busid": f.get("busid"),
-                        "upload_time": f.get("upload_time"),
-                        "uploader": f.get("uploader_name"),
-                    }
-                )
-
-            formatted_folders = []
-            for fol in folders[:limit]:
-                formatted_folders.append(
-                    {
-                        "type": "folder",
-                        "id": fol.get("folder_id"),
-                        "name": fol.get("folder_name"),
-                        "create_time": fol.get("create_time"),
-                        "creator": fol.get("creator_name"),
-                    }
-                )
+            if album_id:
+                files = [self._format_group_album_media(item) for item in page_items]
+                folders = []
+            else:
+                files = []
+                folders = [self._format_group_album(item) for item in page_items]
 
             return json.dumps(
                 {
                     "success": True,
+                    "source": normalized_source,
+                    "view": view,
                     "group_id": group_id,
-                    "folder_id": folder_id or "root",
-                    "file_count": len(formatted_files),
-                    "folder_count": len(formatted_folders),
-                    "files": formatted_files,
-                    "folders": formatted_folders,
+                    "album_id": album_id,
+                    "file_count": len(files),
+                    "folder_count": len(folders),
+                    "files": files,
+                    "folders": folders,
+                    "has_more": has_more,
+                    "next_cursor": next_cursor,
                 },
                 ensure_ascii=False,
             )
@@ -129,8 +421,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 列出文件失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("get_file_download_url")
-    async def get_file_download_url(
+    @llm_tool("qq_get_file_download_url")
+    async def qq_get_file_download_url(
         self,
         event: AstrMessageEvent,
         file_id: str,
@@ -168,6 +460,7 @@ class QQFilePlugin(Star):
             return json.dumps(
                 {
                     "success": True,
+                    "source": "group_file",
                     "url": result.get("url"),
                     "expire": result.get("expire"),
                 },
@@ -178,8 +471,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 获取文件下载链接失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("search_qq_files")
-    async def search_qq_files(
+    @llm_tool("qq_search_files")
+    async def qq_search_files(
         self,
         event: AstrMessageEvent,
         keyword: str,
@@ -239,6 +532,7 @@ class QQFilePlugin(Star):
                     matched_files.append(
                         {
                             "type": "file",
+                            "source": "group_file",
                             "id": f.get("file_id"),
                             "name": f.get("file_name"),
                             "size": format_file_size(f.get("file_size", 0)),
@@ -257,6 +551,7 @@ class QQFilePlugin(Star):
                     matched_folders.append(
                         {
                             "type": "folder",
+                            "source": "group_file",
                             "id": fol.get("folder_id"),
                             "name": fol.get("folder_name"),
                             "create_time": fol.get("create_time"),
@@ -269,6 +564,7 @@ class QQFilePlugin(Star):
             return json.dumps(
                 {
                     "success": True,
+                    "source": "group_file",
                     "group_id": group_id,
                     "folder_id": folder_id or "root",
                     "keyword": keyword,
@@ -284,8 +580,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 搜索文件失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("get_file_info")
-    async def get_file_info(
+    @llm_tool("qq_get_file_info")
+    async def qq_get_file_info(
         self,
         event: AstrMessageEvent,
         file_id: str,
@@ -341,7 +637,9 @@ class QQFilePlugin(Star):
             return json.dumps(
                 {
                     "success": True,
+                    "source": "group_file",
                     "file": {
+                        "source": "group_file",
                         "id": file_data.get("file_id"),
                         "name": file_data.get("file_name"),
                         "size": format_file_size(file_data.get("file_size", 0)),
@@ -359,8 +657,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 获取文件信息失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("request_file_upload")
-    async def request_file_upload(
+    @llm_tool("qq_request_file_upload")
+    async def qq_request_file_upload(
         self,
         event: AstrMessageEvent,
         filename: str,
@@ -442,8 +740,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 启动上传服务器失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("delete_qq_files")
-    async def delete_qq_files(
+    @llm_tool("qq_delete_files")
+    async def qq_delete_files(
         self,
         event: AstrMessageEvent,
         file_ids: str,
@@ -512,8 +810,8 @@ class QQFilePlugin(Star):
             logger.error(f"[QQFile] 批量删除文件失败: {e}")
             return f'{{"error": "{str(e)}"}}'
 
-    @llm_tool("delete_qq_folder")
-    async def delete_qq_folder(
+    @llm_tool("qq_delete_folder")
+    async def qq_delete_folder(
         self,
         event: AstrMessageEvent,
         folder_id: str,
@@ -561,6 +859,140 @@ class QQFilePlugin(Star):
         except Exception as e:
             logger.error(f"[QQFile] 删除文件夹失败: {e}")
             return f'{{"error": "{str(e)}"}}'
+
+    @llm_tool("qq_group_members")
+    async def qq_group_members(
+        self,
+        event: AstrMessageEvent,
+        group_id: Optional[int] = None,
+        page: int = 1,
+        page_size: int = 20,
+        role: Optional[str] = None,
+        no_cache: bool = False,
+    ) -> str:
+        """分页查询QQ群成员，明确返回群主、管理员和普通成员身份。
+
+        Args:
+            group_id(number): 可选。群号。不提供时自动从当前群聊获取。
+            page(number): 可选。页码，从1开始。默认为1。
+            page_size(number): 可选。每页人数，范围1-100。默认为20。
+            role(string): 可选。按身份筛选：owner、admin 或 member。
+            no_cache(boolean): 可选。是否要求 NapCat 刷新成员缓存。默认否。
+
+        Returns:
+            str: 成员分页JSON，包含身份统计、分页信息和成员列表
+        """
+        if group_id is None:
+            group_id = event.get_group_id()
+            if not group_id:
+                return '{"error": "无法获取群号，请在群聊中使用或手动指定群号"}'
+
+        if not self.config.check_access(group_id, event.get_sender_id()):
+            return '{"error": "无权限访问"}'
+
+        if page < 1:
+            return '{"error": "page 必须从 1 开始"}'
+
+        normalized_role = str(role).lower() if role else None
+        if normalized_role not in (None, "owner", "admin", "member"):
+            return '{"error": "role 仅支持 owner、admin 或 member"}'
+
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return '{"error": "Bot不可用"}'
+
+        try:
+            page_size = max(1, min(page_size, 100))
+            result = await bot.api.call_action(
+                "get_group_member_list",
+                group_id=str(group_id),
+                no_cache=no_cache,
+            )
+
+            if isinstance(result, list):
+                raw_members = result
+            else:
+                result_data = self._unwrap_response(result)
+                raw_members = result_data.get(
+                    "members",
+                    result_data.get("member_list", result_data.get("data", [])),
+                )
+            raw_members = raw_members if isinstance(raw_members, list) else []
+            members = [item for item in raw_members if isinstance(item, dict)]
+
+            role_counts = {"owner": 0, "admin": 0, "member": 0}
+            for member in members:
+                member_role = str(member.get("role") or "member").lower()
+                if member_role not in role_counts:
+                    member_role = "member"
+                role_counts[member_role] += 1
+
+            if normalized_role:
+                members = [
+                    member
+                    for member in members
+                    if str(member.get("role") or "member").lower()
+                    == normalized_role
+                ]
+
+            role_order = {"owner": 0, "admin": 1, "member": 2}
+            members.sort(
+                key=lambda member: (
+                    role_order.get(str(member.get("role") or "member").lower(), 2),
+                    str(member.get("card") or member.get("nickname") or ""),
+                    str(member.get("user_id") or ""),
+                )
+            )
+
+            total = len(members)
+            total_pages = math.ceil(total / page_size) if total else 0
+            start = (page - 1) * page_size
+            page_members = members[start : start + page_size]
+            role_names = {
+                "owner": "群主",
+                "admin": "管理员",
+                "member": "成员",
+            }
+            formatted_members = []
+            for member in page_members:
+                member_role = str(member.get("role") or "member").lower()
+                if member_role not in role_names:
+                    member_role = "member"
+                formatted_members.append(
+                    {
+                        "user_id": member.get("user_id"),
+                        "nickname": member.get("nickname"),
+                        "card": member.get("card"),
+                        "display_name": member.get("card") or member.get("nickname"),
+                        "role": member_role,
+                        "role_name": role_names[member_role],
+                        "title": member.get("title"),
+                        "join_time": member.get("join_time"),
+                        "last_sent_time": member.get("last_sent_time"),
+                        "level": member.get("level"),
+                        "is_robot": member.get("is_robot", False),
+                    }
+                )
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "group_id": group_id,
+                    "role_filter": normalized_role,
+                    "role_counts": role_counts,
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": total_pages,
+                    "has_previous": page > 1,
+                    "has_next": page < total_pages,
+                    "members": formatted_members,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as e:
+            logger.error(f"[QQFile] 查询群成员失败: {e}")
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_group_upload(self, event: AstrMessageEvent):

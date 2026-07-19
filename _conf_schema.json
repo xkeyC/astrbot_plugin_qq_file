@@ -21,7 +21,7 @@
     "description": "启用文件搜索功能",
     "type": "bool",
     "default": true,
-    "hint": "是否允许使用 search_qq_files 工具搜索群文件"
+    "hint": "是否允许使用 qq_search_files 工具搜索群文件"
   },
   "enable_auto_process": {
     "description": "启用文件自动处理",

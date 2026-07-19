@@ -1,10 +1,11 @@
 # QQ文件助手插件
 
-让 LLM 拥有感知 QQ 文件的能力，支持获取群文件列表、私聊文件信息、文件下载链接等操作。支持监听群文件上传并自动触发处理。
+让 LLM 拥有感知 QQ 群资料和文件的能力，支持群文件、群相册、群成员分页查询及文件下载链接等操作。支持监听群文件上传并自动触发处理。
 
 ## 功能
 
-- 获取群文件列表（支持文件夹浏览）
+- 统一查询群文件和群相册（支持文件夹、相册媒体及分页游标）
+- 分页查询群成员，明确标注群主、管理员和普通成员身份
 - 获取文件直接下载链接
 - 搜索群文件
 - 支持群聊和私聊
@@ -20,15 +21,39 @@
 
 | 工具名称 | 功能 | 适用场景 |
 |---------|------|---------|
-| `list_qq_files` | 列出当前对话中的文件 | 用户说"看看群文件"、"有什么文件"等 |
-| `get_file_download_url` | 获取文件的直接下载链接 | 用户说"下载这个文件"、"给我文件链接"等 |
-| `search_qq_files` | 搜索群文件 | 用户说"找一下xxx文件"、"搜索pdf文件"等 |
-| `get_file_info` | 获取文件详细信息 | 用户想查看文件元数据（大小、上传者等） |
+| `qq_file` | 统一查询群文件或群相册，每个结果含 `source` | 用户说“看看群文件”“查看群相册”“列出这个相册的照片”等 |
+| `qq_group_members` | 分页查询群成员及身份，可按身份筛选 | 用户说“群主是谁”“查看管理员”“下一页群成员”等 |
+| `qq_get_file_download_url` | 获取群文件的直接下载链接 | 用户说“下载这个文件”“给我文件链接”等 |
+| `qq_search_files` | 搜索群文件 | 用户说“找一下xxx文件”“搜索pdf文件”等 |
+| `qq_get_file_info` | 获取群文件详细信息 | 用户想查看文件元数据（大小、上传者等） |
+| `qq_request_file_upload` | 请求上传文件到群文件 | 模型已准备好一个文件并需要上传到群 |
+| `qq_delete_files` | 批量删除群文件 | 用户明确要求删除一个或多个群文件 |
+| `qq_delete_folder` | 删除群文件夹 | 用户明确要求删除群文件夹及其中内容 |
+
+所有 LLM Tool 名称均以 `qq_` 开头，便于模型识别其 QQ 能力边界。
+
+### `qq_file` 来源与分页
+
+- `source=group_file`（默认）：查询群文件。可使用 `folder_id` 浏览文件夹。
+- `source=group_album` 且不传 `album_id`：查询群相册；相册映射为 `type=folder`、`folder_type=album`。
+- `source=group_album` 且传 `album_id`：查询相册媒体；照片/视频映射为 `type=file`、`file_type=album_media`。
+- 每个文件或文件夹条目都有 `source`，值为 `group_file` 或 `group_album`。
+- 群相册返回 `has_more` 和 `next_cursor`；继续查询时原样传回 `cursor`。
+
+### `qq_group_members` 分页
+
+- `page` 从 1 开始，`page_size` 范围为 1–100。
+- `role` 可选 `owner`、`admin` 或 `member`；返回项同时包含英文 `role` 和中文 `role_name`。
+- 结果按群主、管理员、普通成员排序，并返回全群 `role_counts` 统计。
 
 ### 使用示例
 
 **群聊场景：**
 - "查看群文件列表"
+- "查看群相册"
+- "打开这个相册，继续看下一页"
+- "查一下群主和管理员"
+- "列出第二页群成员，每页50人"
 - "搜索会议记录"
 - "给我xxx.pdf的下载链接"
 - "这个文件是谁上传的"
@@ -114,14 +139,19 @@
 
 本插件使用以下 NapCatQQ OneBot API：
 
+- `get_group_root_files` - 获取群文件根目录
 - `get_group_files_by_folder` - 获取群文件列表
 - `get_group_file_url` - 获取群文件下载链接
 - `get_private_file_url` - 获取私聊文件下载链接
+- `get_group_member_list` - 获取群成员列表（插件侧分页与身份映射）
+- `get_qun_album_list` - 获取群相册列表（支持 `attach_info` 游标）
+- `get_group_album_media_list` - 获取群相册媒体（支持 `attach_info` 游标）
 - `group_upload` (Notice 事件) - 监听群文件上传
 
 ### 文件 ID 说明
 
-- **群文件**: 通过 `list_qq_files` 获取的文件 ID 可直接用于获取下载链接
+- **群文件**: 通过 `qq_file`（`source=group_file`）获取的文件 ID 可用于获取下载链接
+- **群相册媒体**: `qq_file` 会直接返回 NapCat 提供的媒体 URL，不使用群文件下载接口
 - **私聊文件**: 用户发送的文件会自动生成 file_id，可通过工具获取链接
 
 ## 安装
