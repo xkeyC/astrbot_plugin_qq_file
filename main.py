@@ -18,7 +18,7 @@ from .utils import format_file_size, get_lan_ip, TemporaryUploadServer
     "astrbot_plugin_qq_file",
     "xkeyC",
     "QQ信息与文件管理插件，支持LLM查询群文件、群相册、群成员并自动处理上传文件",
-    "3.2.0",
+    "3.3.0",
 )
 class QQFilePlugin(Star):
     """QQ信息与文件管理插件 - 支持LLM Tools和文件上传监听"""
@@ -867,15 +867,17 @@ class QQFilePlugin(Star):
         group_id: Optional[int] = None,
         page: int = 1,
         page_size: int = 20,
+        keyword: Optional[str] = None,
         role: Optional[str] = None,
         no_cache: bool = False,
     ) -> str:
-        """分页查询QQ群成员，明确返回群主、管理员和普通成员身份。
+        """分页查询QQ群成员，支持昵称搜索并明确返回成员身份。
 
         Args:
             group_id(number): 可选。群号。不提供时自动从当前群聊获取。
             page(number): 可选。页码，从1开始。默认为1。
             page_size(number): 可选。每页人数，范围1-100。默认为20。
+            keyword(string): 可选。昵称或群名片关键词，支持不区分大小写的模糊搜索。
             role(string): 可选。按身份筛选：owner、admin 或 member。
             no_cache(boolean): 可选。是否要求 NapCat 刷新成员缓存。默认否。
 
@@ -896,6 +898,7 @@ class QQFilePlugin(Star):
         normalized_role = str(role).lower() if role else None
         if normalized_role not in (None, "owner", "admin", "member"):
             return '{"error": "role 仅支持 owner、admin 或 member"}'
+        normalized_keyword = str(keyword).strip().casefold() if keyword else ""
 
         bot = getattr(event, "bot", None)
         if not bot:
@@ -919,6 +922,7 @@ class QQFilePlugin(Star):
                 )
             raw_members = raw_members if isinstance(raw_members, list) else []
             members = [item for item in raw_members if isinstance(item, dict)]
+            group_total = len(members)
 
             role_counts = {"owner": 0, "admin": 0, "member": 0}
             for member in members:
@@ -935,11 +939,23 @@ class QQFilePlugin(Star):
                     == normalized_role
                 ]
 
+            if normalized_keyword:
+                members = [
+                    member
+                    for member in members
+                    if normalized_keyword
+                    in str(member.get("nickname") or "").casefold()
+                    or normalized_keyword
+                    in str(member.get("card") or "").casefold()
+                ]
+
             role_order = {"owner": 0, "admin": 1, "member": 2}
             members.sort(
                 key=lambda member: (
                     role_order.get(str(member.get("role") or "member").lower(), 2),
-                    str(member.get("card") or member.get("nickname") or ""),
+                    str(
+                        member.get("card") or member.get("nickname") or ""
+                    ).casefold(),
                     str(member.get("user_id") or ""),
                 )
             )
@@ -978,8 +994,10 @@ class QQFilePlugin(Star):
                 {
                     "success": True,
                     "group_id": group_id,
+                    "keyword": str(keyword).strip() if keyword else None,
                     "role_filter": normalized_role,
                     "role_counts": role_counts,
+                    "group_total": group_total,
                     "total": total,
                     "page": page,
                     "page_size": page_size,

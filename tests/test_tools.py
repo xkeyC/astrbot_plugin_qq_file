@@ -153,6 +153,52 @@ class QQToolTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in second_page["members"]], ["member"])
         self.assertFalse(second_page["has_next"])
 
+    def test_group_members_searches_nickname_and_card_before_pagination(self):
+        bot = FakeBot(
+            {
+                "get_group_member_list": [
+                    {"user_id": 4, "nickname": "Alice", "role": "member"},
+                    {"user_id": 5, "nickname": "ALICIA", "role": "member"},
+                    {
+                        "user_id": 6,
+                        "nickname": "Bob",
+                        "card": "Alice 管理员",
+                        "role": "admin",
+                    },
+                    {"user_id": 7, "nickname": "Charles", "role": "owner"},
+                ]
+            }
+        )
+        plugin = make_plugin()
+        event = FakeEvent(bot)
+
+        first = json.loads(
+            asyncio.run(
+                plugin.qq_group_members(
+                    event, keyword="ALI", page=1, page_size=2
+                )
+            )
+        )
+        second = json.loads(
+            asyncio.run(
+                plugin.qq_group_members(
+                    event, keyword="ALI", page=2, page_size=2
+                )
+            )
+        )
+
+        self.assertEqual(first["keyword"], "ALI")
+        self.assertEqual(first["group_total"], 4)
+        self.assertEqual(first["total"], 3)
+        self.assertEqual(first["total_pages"], 2)
+        self.assertEqual(
+            [member["user_id"] for member in first["members"]], [6, 4]
+        )
+        self.assertEqual(
+            [member["user_id"] for member in second["members"]], [5]
+        )
+        self.assertFalse(second["has_next"])
+
     def test_group_file_items_include_source(self):
         bot = FakeBot(
             {
